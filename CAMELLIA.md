@@ -33,6 +33,7 @@ put behind a build option.
 Build:
 
 ```sh
+cd /path/to/UniXNU
 export WORKSPACE=$PWD
 export MUROOT=$PWD/out/feeds/mu_basecore-89034cbb
 export PACKAGES_PATH=$PWD/drivers/DarwinBoot:$PWD/package:$MUROOT
