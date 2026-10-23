@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include <Uefi.h>
+#include <Pi/PiDxeCis.h>
 #include <Guid/FileInfo.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -11,6 +12,7 @@
 #include <Protocol/UniXNULoader.h>
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
+#include <Protocol/Cpu.h>
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
@@ -20,6 +22,38 @@
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
 #define MAX_SEGMENTS 64
+#define KERNEL_STAGE_BASE     0x140000000ULL
+#define KERNEL_STAGE_SIZE     0x04000000ULL
+#define FIXED_WINDOW_BASE     0x98000000ULL
+#define FIXED_WINDOW_SIZE     0x05000000ULL
+#define DARWIN_FB_HANDOFF     0xA4000000ULL
+#define DARWIN_FB_PAGE_MAP_ADDR 0xA4000100ULL
+#define DARWIN_FB_MAP_MAGIC   0x314D504649465545ULL
+
+#pragma pack(1)
+typedef struct {
+  UINT64 Physical;
+  UINT32 Pages;
+  UINT32 Reserved;
+} DARWIN_FB_RUN;
+
+typedef struct {
+  UINT64 Magic;
+  UINT64 LogicalSize;
+  UINT32 PageSize;
+  UINT32 RunCount;
+  DARWIN_FB_RUN Runs[100];
+} DARWIN_FB_PAGE_MAP;
+
+typedef struct {
+  UINT64 Magic;
+  UINT64 Base;
+  UINT32 Width;
+  UINT32 Height;
+  UINT32 Pitch;
+  UINT32 Depth;
+} DARWIN_FB_HANDOFF_INFO;
+#pragma pack()
 
 typedef struct {
   UINT64  Address;
@@ -38,8 +72,122 @@ typedef struct {
 } KERNEL;
 
 STATIC EFI_HANDLE  mImage;
+STATIC UINTN       mFailStage;
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
+
+VOID
+EFIAPI
+DarwinScanoutColorBands (
+  VOID
+  )
+{
+  DARWIN_FB_HANDOFF_INFO *Handoff;
+  DARWIN_FB_PAGE_MAP *Map;
+  UINTN CacheLineSize;
+  UINT64 End;
+  UINT64 Logical;
+  UINT64 Pitch;
+  UINT64 RunEnd;
+  UINT32 Run;
+
+  Handoff = (DARWIN_FB_HANDOFF_INFO *)(UINTN)DARWIN_FB_HANDOFF;
+  Map = (DARWIN_FB_PAGE_MAP *)(UINTN)DARWIN_FB_PAGE_MAP_ADDR;
+  if ((Map->Magic != DARWIN_FB_MAP_MAGIC) ||
+      (Map->PageSize == 0) ||
+      (Map->RunCount == 0) ||
+      (Map->RunCount > 100) ||
+      (Handoff->Pitch == 0) ||
+      (Handoff->Height == 0)) {
+    return;
+  }
+
+  Pitch = Handoff->Pitch;
+  End = Pitch * Handoff->Height;
+  if (End > Map->LogicalSize) {
+    End = Map->LogicalSize;
+  }
+  __asm__ volatile ("mrs %0, ctr_el0" : "=r" (CacheLineSize));
+  CacheLineSize = 4U << ((CacheLineSize >> 16) & 0xF);
+
+  Logical = 0;
+  for (Run = 0; Run < Map->RunCount; Run++) {
+    UINT64 RunBytes =
+      (UINT64)Map->Runs[Run].Pages * Map->PageSize;
+    UINT32 *Destination;
+    UINT64 Address;
+    UINT64 Start;
+    UINT64 Finish;
+    UINT64 Index;
+
+    RunEnd = Logical + RunBytes;
+    if (Logical >= End) {
+      break;
+    }
+    Start = Logical;
+    Finish = MIN (RunEnd, End);
+    Destination = (UINT32 *)(UINTN)(
+      Map->Runs[Run].Physical + (Start - Logical)
+      );
+    for (Index = Start; Index < Finish; Index += sizeof (*Destination)) {
+      UINT64 Row = Index / Pitch;
+
+      if (Row < Handoff->Height / 4) {
+        *Destination++ = 0xFF00FF00;
+      } else if (Row < Handoff->Height / 2) {
+        *Destination++ = 0xFF0000FF;
+      } else if (Row < (Handoff->Height * 3) / 4) {
+        *Destination++ = 0xFFFFFFFF;
+      } else {
+        *Destination++ = 0xFFFFFF00;
+      }
+    }
+    Address = Map->Runs[Run].Physical & ~((UINT64)CacheLineSize - 1);
+    while (Address < Map->Runs[Run].Physical + RunBytes) {
+      __asm__ volatile ("dc civac, %0" : : "r" (Address) : "memory");
+      Address += CacheLineSize;
+    }
+    Logical = RunEnd;
+  }
+  __asm__ volatile ("dsb sy" : : : "memory");
+}
+
+UINT64
+EFIAPI
+DarwinScanoutMarkerAddress (
+  VOID
+  )
+{
+  DARWIN_FB_HANDOFF_INFO *Handoff;
+  DARWIN_FB_PAGE_MAP *Map;
+  UINT64 Logical;
+  UINT64 Target;
+  UINT32 Run;
+
+  Handoff = (DARWIN_FB_HANDOFF_INFO *)(UINTN)DARWIN_FB_HANDOFF;
+  Map = (DARWIN_FB_PAGE_MAP *)(UINTN)DARWIN_FB_PAGE_MAP_ADDR;
+  if ((Map->Magic != DARWIN_FB_MAP_MAGIC) ||
+      (Map->PageSize == 0) ||
+      (Map->RunCount == 0) ||
+      (Map->RunCount > 100) ||
+      (Handoff->Pitch == 0) ||
+      (Handoff->Height == 0)) {
+    return 0;
+  }
+
+  Target = (UINT64)Handoff->Pitch * (Handoff->Height / 8);
+  Logical = 0;
+  for (Run = 0; Run < Map->RunCount; Run++) {
+    UINT64 RunBytes =
+      (UINT64)Map->Runs[Run].Pages * Map->PageSize;
+
+    if (Target < Logical + RunBytes) {
+      return Map->Runs[Run].Physical + (Target - Logical);
+    }
+    Logical += RunBytes;
+  }
+  return 0;
+}
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
@@ -69,6 +217,7 @@ ReadFile (
   EFI_FILE_PROTOCOL *Root,
   CONST CHAR16      *Path,
   UINTN             Limit,
+  VOID              *FixedBuffer,
   VOID              **Data,
   UINTN             *Size
   )
@@ -97,7 +246,7 @@ ReadFile (
     goto Done;
   }
   *Size = (UINTN)Info->FileSize;
-  *Data = AllocatePool (*Size);
+  *Data = FixedBuffer != NULL ? FixedBuffer : AllocatePool (*Size);
   if (*Data == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
   Actual = *Size;
   Status = File->Read (File, &Actual, *Data);
@@ -105,9 +254,115 @@ ReadFile (
 Done:
   if (Info != NULL) { FreePool (Info); }
   File->Close (File);
+  if (EFI_ERROR (Status) && (*Data != NULL)) {
+    if (FixedBuffer == NULL) { FreePool (*Data); }
+    *Data = NULL;
+  }
+  return Status;
+}
+
+#if 0
+STATIC
+EFI_STATUS
+ReadKernelHeader (
+  EFI_FILE_PROTOCOL *Root,
+  CONST CHAR16      *Path,
+  VOID              **Data,
+  UINTN             *DataSize,
+  UINTN             *FileSize
+  )
+{
+  EFI_STATUS         Status;
+  EFI_FILE_PROTOCOL  *File;
+  EFI_FILE_INFO      *Info;
+  UINTN              InfoSize;
+  UINTN              Actual;
+
+  *Data = NULL;
+  *DataSize = 0;
+  *FileSize = 0;
+  Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR (Status)) { return Status; }
+  Info = NULL;
+  InfoSize = 0;
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
+  if (Status != EFI_BUFFER_TOO_SMALL) { goto Done; }
+  Info = AllocatePool (InfoSize);
+  if (Info == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+  if (EFI_ERROR (Status)) { goto Done; }
+  if ((Info->Attribute & EFI_FILE_DIRECTORY) ||
+      (Info->FileSize == 0) || (Info->FileSize > SIZE_128MB)) {
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Done;
+  }
+  *FileSize = (UINTN)Info->FileSize;
+  *DataSize = MIN (*FileSize, (UINTN)KERNEL_HEADER_SIZE);
+  *Data = AllocatePool (*DataSize);
+  if (*Data == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
+  Actual = *DataSize;
+  Status = File->Read (File, &Actual, *Data);
+  if (!EFI_ERROR (Status) && (Actual != *DataSize)) { Status = EFI_DEVICE_ERROR; }
+Done:
+  if (Info != NULL) { FreePool (Info); }
+  File->Close (File);
   if (EFI_ERROR (Status) && (*Data != NULL)) { FreePool (*Data); *Data = NULL; }
   return Status;
 }
+
+STATIC
+EFI_STATUS
+StreamKernelSegments (
+  EFI_FILE_PROTOCOL *Root,
+  CONST CHAR16      *Path,
+  CONST KERNEL      *Kernel,
+  EFI_PHYSICAL_ADDRESS Address
+  )
+{
+  EFI_STATUS         Status;
+  EFI_FILE_PROTOCOL  *File;
+  UINT8              *Buffer;
+  UINTN              Index;
+  UINTN              Done;
+  UINTN              Chunk;
+
+  Buffer = AllocatePool (KERNEL_HEADER_SIZE);
+  if (Buffer == NULL) { return EFI_OUT_OF_RESOURCES; }
+  Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR (Status)) { FreePool (Buffer); return Status; }
+
+  for (Index = 0; Index < Kernel->Count; Index++) {
+    CONST SEGMENT *Segment = &Kernel->Segments[Index];
+    UINT8 *Destination;
+    UINT64 Remaining;
+
+    if (Segment->FileSize == 0) { continue; }
+    Status = File->SetPosition (File, Segment->FileOffset);
+    if (EFI_ERROR (Status)) { break; }
+    Destination = (UINT8 *)(UINTN)(
+      Address + Segment->Address - Kernel->Base
+      );
+    Remaining = Segment->FileSize;
+    while (Remaining != 0) {
+      Chunk = (UINTN)MIN (Remaining, (UINT64)KERNEL_HEADER_SIZE);
+      Done = Chunk;
+      Status = File->Read (File, &Done, Buffer);
+      if (EFI_ERROR (Status) || (Done != Chunk)) {
+        Status = EFI_DEVICE_ERROR;
+        break;
+      }
+      CopyMem (Destination, Buffer, Chunk);
+      Destination += Chunk;
+      Remaining -= Chunk;
+    }
+    if (EFI_ERROR (Status)) { break; }
+  }
+
+  File->Close (File);
+  FreePool (Buffer);
+  return Status;
+}
+#endif
 
 STATIC
 EFI_STATUS
@@ -415,6 +670,16 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   UINT64                RunBytes;
 
   *Address = 0;
+  Candidate = ALIGN_VALUE (FIXED_WINDOW_BASE, BLOCK_SIZE) +
+              (Kernel->Base & (BLOCK_SIZE - 1));
+  Print (L"DARWINBOOT: allocate requested=0x%lx fixed-max=0x%lx candidate=0x%lx\n",
+         WindowSize, (UINT64)FIXED_WINDOW_SIZE, Candidate);
+  if (WindowSize <= FIXED_WINDOW_SIZE) {
+    *Address = Candidate;
+    Print (L"DARWINBOOT: fixed window pa=0x%lx size=0x%lx base=0x%lx\n",
+           Candidate, WindowSize, Kernel->Base);
+    return EFI_SUCCESS;
+  }
   Map = NULL;
   Capacity = 0;
   BestStart = 0;
@@ -461,6 +726,7 @@ Boot (
   )
 {
   EFI_STATUS                      Status;
+  EFI_CPU_ARCH_PROTOCOL           *Cpu;
   EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Fs;
   EFI_FILE_PROTOCOL               *Root;
   VOID                            *Image;
@@ -503,6 +769,7 @@ Boot (
   UINT64                          Video[6];
 
   (VOID)This;
+  mFailStage = 1;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
       (DarwinCurrentEl () != 4)) {
@@ -528,26 +795,39 @@ Boot (
   Tree = NULL;
   TrustCaches = NULL;
   Addon = NULL;
+  Cpu = NULL;
   AddonSize = 0;
   TreePath = NULL;
   Map = NULL;
   Address = 0;
   Capacity = 0;
+  mFailStage = 2;
   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
-  Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
+  mFailStage = 3;
+  Status = ReadFile (
+             Root,
+             Request->KernelPath,
+             KERNEL_STAGE_SIZE,
+             (VOID *)(UINTN)KERNEL_STAGE_BASE,
+             &Image,
+             &ImageSize
+             );
   if (EFI_ERROR (Status)) { goto Fail; }
+  mFailStage = 4;
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
+  mFailStage = 5;
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
-  Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
+  Status = ReadFile (Root, TreePath, SIZE_16MB, NULL, &Tree, &TreeSize);
   if (EFI_ERROR (Status)) { goto Fail; }
+  mFailStage = 6;
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;
@@ -555,6 +835,7 @@ Boot (
   WindowSize = 0;
   KeepPacked = FALSE;
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  mFailStage = 7;
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -567,7 +848,14 @@ Boot (
   }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
-  Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
+  Status = ReadFile (
+             Root,
+             TreePath,
+             SIZE_16MB,
+             NULL,
+             &TrustCaches,
+             &TrustCacheSize
+             );
   if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
   if (TrustCaches != NULL) {
     if ((TrustCacheOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + TrustCacheOffset) != 0) ||
@@ -585,7 +873,7 @@ Boot (
   //
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".gpuaddon");
-  Status = ReadFile (Root, TreePath, SIZE_64MB, &Addon, &AddonSize);
+  Status = ReadFile (Root, TreePath, SIZE_64MB, NULL, &Addon, &AddonSize);
   if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
   if (Addon != NULL) {
     if ((AddonOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + AddonOffset) != 0) || (U64 ((UINT8 *)Tree + AddonOffset + 8) != 0) ||
@@ -597,10 +885,13 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
+  mFailStage = 8;
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
+  mFailStage = 9;
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
+  mFailStage = 10;
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
@@ -613,10 +904,14 @@ Boot (
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
+  mFailStage = 11;
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
   for (Index = 0; Index < Kernel.Count; Index++) {
-    CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
-             (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
+    CopyMem (
+      (VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
+      (UINT8 *)Image + Kernel.Segments[Index].FileOffset,
+      (UINTN)Kernel.Segments[Index].FileSize
+      );
   }
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
@@ -649,10 +944,26 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
     FreePool (Addon); Addon = NULL;
   }
-  FreePool (Image); Image = NULL;
+  Status = gBS->LocateProtocol (&gEfiCpuArchProtocolGuid, NULL, (VOID **)&Cpu);
+  if (EFI_ERROR (Status)) {
+    mFailStage = 14;
+    goto Fail;
+  }
+  Status = Cpu->FlushDataCache (
+                  Cpu,
+                  Address,
+                  (UINTN)Used,
+                  EfiCpuFlushTypeWriteBackInvalidate
+                  );
+  if (EFI_ERROR (Status)) {
+    mFailStage = 15;
+    goto Fail;
+  }
+  Image = NULL;
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
+  mFailStage = 12;
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
@@ -681,6 +992,7 @@ Boot (
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
+  mFailStage = 13;
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
@@ -698,16 +1010,35 @@ Boot (
   CpuDeadLoop ();
   return EFI_ABORTED;
 Fail:
+  {
+    CHAR16 StageLine[96];
+    UnicodeSPrint (
+      StageLine,
+      sizeof (StageLine),
+      L"DARWINBOOT FAIL STAGE %u STATUS %r",
+      (UINT32)mFailStage,
+      Status
+      );
+    DiagDraw (StageLine, 0);
+    Print (L"%s\n", StageLine);
+  }
   if (Root != NULL) { Root->Close (Root); }
-  if (Image != NULL) { FreePool (Image); }
+  if ((Image != NULL) &&
+      (Image != (VOID *)(UINTN)KERNEL_STAGE_BASE)) {
+    FreePool (Image);
+  }
   if (Tree != NULL) { FreePool (Tree); }
   if (TrustCaches != NULL) { FreePool (TrustCaches); }
   if (Addon != NULL) { FreePool (Addon); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
-  if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
+  if ((Address != 0) && (Address != FIXED_WINDOW_BASE)) {
+    gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize));
+  }
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
-  return Status;
+  for (;;) {
+    CpuDeadLoop ();
+  }
 }
 
 STATIC UNIXNU_LOADER_PROTOCOL mLoader = { UNIXNU_LOADER_REVISION, Boot };
