@@ -6,7 +6,8 @@ bring-up work.
 It is not release-ready. The current code has hardware-specific staging and
 framebuffer addresses, bring-up drawing, and diagnostic failure loops. These
 are used to isolate the XNU handoff on a device whose UEFI memory map does not
-provide a usable large allocation.
+provide a usable large allocation. The XNU destination window is in high DDR,
+away from the payload and scanout ranges.
 
 Hardware status:
 
