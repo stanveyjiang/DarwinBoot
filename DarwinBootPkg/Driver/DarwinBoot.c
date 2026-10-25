@@ -925,6 +925,20 @@ Boot (
   Args->DeviceTree = Kernel.Base + TreeAddress - Address;
   Args->DeviceTreeLength = (UINT32)TreeSize;
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
+  {
+    DARWIN_FB_PAGE_MAP *FbPageMap =
+      (DARWIN_FB_PAGE_MAP *)(UINTN)DARWIN_FB_PAGE_MAP_ADDR;
+    if ((FbPageMap->Magic == DARWIN_FB_MAP_MAGIC) &&
+        (FbPageMap->PageSize != 0) &&
+        (FbPageMap->RunCount != 0) &&
+        (FbPageMap->RunCount <= 100)) {
+      CopyMem (
+        (VOID *)(UINTN)(ArgsAddress + DARWIN_BOOT_ARGS_PAGE_MAP_OFFSET),
+        FbPageMap,
+        sizeof (*FbPageMap)
+        );
+    }
+  }
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
   if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }

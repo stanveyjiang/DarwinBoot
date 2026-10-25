@@ -30,4 +30,11 @@ STATIC_ASSERT (OFFSET_OF (DARWIN_BOOT_ARGS, CommandLine) == 0x6c, "command line 
 STATIC_ASSERT (OFFSET_OF (DARWIN_BOOT_ARGS, MemorySizeActual) == 0x478, "memory ABI");
 STATIC_ASSERT (sizeof (DARWIN_BOOT_ARGS) == 0x480, "boot_args ABI");
 
+#define DARWIN_BOOT_ARGS_PAGE_MAP_OFFSET  0x500U
+#define DARWIN_BOOT_ARGS_PAGE_MAP_SIZE    0x680U
+STATIC_ASSERT (
+  DARWIN_BOOT_ARGS_PAGE_MAP_OFFSET + DARWIN_BOOT_ARGS_PAGE_MAP_SIZE <= 0x1000U,
+  "FB page map must fit in the boot_args page"
+  );
+
 #endif
